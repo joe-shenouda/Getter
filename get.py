@@ -4,16 +4,19 @@ import requests
 import threading
 import time
 from urllib.parse import urlparse
+import queue
 
 class Application(tk.Frame):
     def __init__(self, master=None):
         super().__init__(master)
         self.master = master
+        self.master.title("Getter")
         self.pack()
         self.create_widgets()
         self.successful_gets = 0
         self.errors = 0
         self.running = False
+        self.queue = queue.Queue()
 
     def create_widgets(self):
         self.url_label = tk.Label(self)
@@ -68,6 +71,7 @@ class Application(tk.Frame):
     def start_gets(self):
         if not self.running:
             self.running = True
+            self.start_button["state"] = "disabled"
             self.successful_gets = 0
             self.errors = 0
             self.successful_gets_label["text"] = "Successful GETs: 0"
@@ -77,42 +81,79 @@ class Application(tk.Frame):
             self.log_text.config(state="disabled")
             self.thread = threading.Thread(target=self.send_gets)
             self.thread.start()
+            self.master.after(100, self.process_queue)
+
+    def process_queue(self):
+        try:
+            msg = self.queue.get_nowait()
+            if isinstance(msg, dict):
+                if "success" in msg:
+                    self.successful_gets += 1
+                    self.successful_gets_label["text"] = f"Successful GETs: {self.successful_gets}"
+                elif "error" in msg:
+                    self.errors += 1
+                    self.errors_label["text"] = f"Errors: {self.errors}"
+                if "log" in msg:
+                    self.log(msg["log"])
+            elif "validation_error" in msg:
+                messagebox.showerror("Error", msg["validation_error"])
+                self.running = False
+                self.start_button["state"] = "normal"
+                return
+            elif msg == "done":
+                self.running = False
+                self.start_button["state"] = "normal"
+                return
+        except queue.Empty:
+            pass
+        self.master.after(100, self.process_queue)
 
     def send_gets(self):
+        try:
+            inputs = self._parse_inputs()
+        except ValueError as e:
+            self.queue.put({"validation_error": f"Invalid input: {e}"})
+            return
+
+        self._execute_requests(inputs)
+        self.queue.put("done")
+
+    def _parse_inputs(self):
         url = self.url_entry.get()
+        if not url:
+            raise ValueError("URL cannot be empty.")
         num_gets = int(self.gets_entry.get())
         delay = int(self.delay_entry.get())
-        port = self.port_entry.get()
+        port_str = self.port_entry.get()
+        port = int(port_str) if port_str else None
+        return {"url": url, "num_gets": num_gets, "delay": delay, "port": port}
+
+    def _execute_requests(self, inputs):
+        url = inputs["url"]
+        num_gets = inputs["num_gets"]
+        delay = inputs["delay"]
+        port = inputs["port"]
+
         parsed_url = urlparse(url)
         ip = parsed_url.hostname
-        if port:
-            port = int(port)
-        else:
+        if port is None:
             port = parsed_url.port if parsed_url.port else 80 if parsed_url.scheme == 'http' else 443
+
+        # Reconstruct URL to include the correct port, preserving other parts
+        url_parts = list(parsed_url)
+        url_parts[1] = f"{ip}:{port}" # Update netloc
+        url_with_port = urlparse.urlunparse(url_parts)
 
         for i in range(num_gets):
             try:
-                # Construct the URL with the specified port
-                if port:
-                    url_with_port = f"{parsed_url.scheme}://{ip}:{port}{parsed_url.path}"
-                else:
-                    url_with_port = url
-
                 response = requests.get(url_with_port)
                 if response.status_code == 200:
-                    self.successful_gets += 1
-                    self.successful_gets_label["text"] = f"Successful GETs: {self.successful_gets}"
-                    self.log(f"GET {url_with_port} successful ({response.status_code}) from {ip}:{port}")
+                    self.queue.put({"success": True, "log": f"GET {url_with_port} successful ({response.status_code}) from {ip}:{port}"})
                 else:
-                    self.errors += 1
-                    self.errors_label["text"] = f"Errors: {self.errors}"
-                    self.log(f"GET {url_with_port} failed ({response.status_code}) from {ip}:{port}")
+                    self.queue.put({"error": True, "log": f"GET {url_with_port} failed ({response.status_code}) from {ip}:{port}"})
             except requests.exceptions.RequestException as e:
-                self.errors += 1
-                self.errors_label["text"] = f"Errors: {self.errors}"
-                self.log(f"GET {url_with_port} failed: {e} from {ip}:{port}")
+                self.queue.put({"error": True, "log": f"GET {url_with_port} failed: {e} from {ip}:{port}"})
             time.sleep(delay / 1000)
-        self.running = False
 
     def log(self, message):
         self.log_text.config(state="normal")
